@@ -32,6 +32,7 @@ from swingscanner.config import load_config
 from swingscanner.universe import load_universe
 from swingscanner.nse_data import BhavcopyStore, compute_delivery_ratios
 from swingscanner.ohlc import fetch_ohlc_bulk, add_indicators
+from swingscanner.sectors import get_sector
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -45,7 +46,7 @@ def setup_logging(level: str = "INFO") -> None:
 
 
 def send_telegram(text: str, bot_token: str | None, chat_id: str | None) -> None:
-    """Send to Telegram. Falls back to stdout if no credentials."""
+    """Send to Telegram (HTML parse mode). Falls back to stdout if no creds."""
     if not text:
         return
     if not bot_token or not chat_id or "PASTE" in str(bot_token):
@@ -57,7 +58,6 @@ def send_telegram(text: str, bot_token: str | None, chat_id: str | None) -> None
 
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
 
-    # Chunk on line boundaries (Telegram limit is 4096 chars)
     chunks: list[str] = []
     cur = ""
     for line in text.split("\n"):
@@ -73,7 +73,7 @@ def send_telegram(text: str, bot_token: str | None, chat_id: str | None) -> None
             r = requests.post(url, data={
                 "chat_id": chat_id,
                 "text": chunk,
-                "parse_mode": "Markdown",
+                "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             }, timeout=15)
             if r.status_code != 200:
@@ -82,86 +82,57 @@ def send_telegram(text: str, bot_token: str | None, chat_id: str | None) -> None
             logging.error("Telegram send failed: %s", e)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Simple delivery+volume scanner — Telegram alerter")
-    parser.add_argument("--universe", default="nifty500.csv",
-                        help="CSV with a 'symbol' column (default: nifty500.csv)")
-    # Filter knobs
-    parser.add_argument("--min-pct-change", type=float, default=0.0,
-                        help="Close must be up by at least this %% (default 0)")
-    parser.add_argument("--min-delivery-qty", type=int, default=10000,
-                        help="Minimum delivery quantity in shares (default 10000)")
-    parser.add_argument("--min-delivery-times", type=float, default=3.0,
-                        help="Today's delivery / N-day avg, minimum (default 3.0)")
-    parser.add_argument("--delivery-lookback", type=int, default=20,
-                        help="Days for delivery-times average (default 20)")
-    parser.add_argument("--min-vol-ratio-1d", type=float, default=3.0,
-                        help="Today's volume must be >= this × yesterday's (default 3.0)")
-    parser.add_argument("--require-above-200ema", action="store_true", default=True,
-                        help="Require close > 200 EMA (default on)")
-    parser.add_argument("--no-above-200ema", dest="require_above_200ema",
-                        action="store_false", help="Disable the 200 EMA filter")
-    # Data/runtime
-    parser.add_argument("--bhavcopy-days", type=int, default=25,
-                        help="Bhavcopy history (must exceed delivery_lookback)")
-    parser.add_argument("--cache-dir", default=".cache/bhavcopy")
-    parser.add_argument("--config", default="config.yaml",
-                        help="Read Telegram credentials from this YAML")
-    parser.add_argument("--top-n", type=int, default=25,
-                        help="How many top results to include in the report")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Print report instead of sending to Telegram")
-    parser.add_argument("--no-cache", action="store_true",
-                        help="Force re-download of bhavcopies")
-    args = parser.parse_args()
+def run_scan(
+    universe_csv: str = "nifty500.csv",
+    min_pct_change: float = 0.0,
+    min_delivery_qty: int = 10000,
+    min_delivery_times: float = 3.0,
+    delivery_lookback: int = 20,
+    min_vol_ratio_1d: float = 3.0,
+    require_above_200ema: bool = True,
+    bhavcopy_days: int = 25,
+    cache_dir: str = ".cache/bhavcopy",
+    top_n: int = 25,
+    no_cache: bool = False,
+) -> tuple[list[dict], str]:
+    """
+    Run the full scan and return (candidates_list, formatted_report_text).
 
-    setup_logging()
+    Pure-function-ish: no argv parsing, no Telegram send. Callers (CLI,
+    Azure Function) wrap this and decide what to do with the output.
+    """
     log = logging.getLogger("scanner")
-
-    log.info("=" * 70)
-    log.info("Delivery + Volume Scanner")
-    log.info("=" * 70)
-    log.info("Filters:")
-    log.info("  %% change      > %.1f%%", args.min_pct_change)
-    log.info("  delivery qty  > %d shares", args.min_delivery_qty)
-    log.info("  delivery x    >= %.1f (over prior %d days)",
-             args.min_delivery_times, args.delivery_lookback)
-    log.info("  volume vs prev day  >= %.1f x", args.min_vol_ratio_1d)
-    log.info("  above 200 EMA       = %s", args.require_above_200ema)
+    log.info("Filters: %%chg>%.1f | deliv_qty>%d | deliv×≥%.1f | vol/prev≥%.1f | 200EMA=%s",
+             min_pct_change, min_delivery_qty, min_delivery_times,
+             min_vol_ratio_1d, require_above_200ema)
 
     t0 = time.time()
+    symbols = load_universe(universe_csv)
 
-    # ---- 1. Universe -------------------------------------------------
-    symbols = load_universe(args.universe)
-
-    # ---- 2. Bhavcopies (delivery data) -------------------------------
-    log.info("Fetching NSE bhavcopies (%d days)...", args.bhavcopy_days)
-    store = BhavcopyStore(args.cache_dir)
-    if args.no_cache:
+    log.info("Fetching NSE bhavcopies (%d days)...", bhavcopy_days)
+    store = BhavcopyStore(cache_dir)
+    if no_cache:
         import shutil
         shutil.rmtree(store.cache_dir, ignore_errors=True)
         store.cache_dir.mkdir(parents=True, exist_ok=True)
     bhavs = store.get_history(end_date=datetime.now(),
-                              lookback_days=args.bhavcopy_days)
+                              lookback_days=bhavcopy_days)
     if not bhavs:
-        log.error("No bhavcopy data available. NSE publishes around 6 PM IST — "
-                  "try later, or check your network.")
-        return 1
+        log.error("No bhavcopy data. NSE publishes around 6 PM IST.")
+        return [], _empty_message(min_pct_change, min_delivery_qty,
+                                  min_delivery_times, min_vol_ratio_1d,
+                                  note="Bhavcopy unavailable — run after 6 PM IST")
     delivery_df = compute_delivery_ratios(bhavs)
     if delivery_df is None or delivery_df.empty:
         log.error("Could not compute delivery ratios.")
-        return 1
-    log.info("Delivery data: %d symbols, ratio range %.1f-%.1f",
-             len(delivery_df),
-             delivery_df["deliv_ratio"].min(),
-             delivery_df["deliv_ratio"].max())
+        return [], _empty_message(min_pct_change, min_delivery_qty,
+                                  min_delivery_times, min_vol_ratio_1d,
+                                  note="Delivery data unavailable")
+    log.info("Delivery data: %d symbols", len(delivery_df))
 
-    # ---- 3. OHLC bulk fetch (for EMA + volume) -----------------------
-    log.info("Bulk-fetching OHLC for EMA + volume check...")
+    log.info("Bulk-fetching OHLC...")
     ohlc_cache = fetch_ohlc_bulk(symbols, days=250)
 
-    # ---- 4. Filter -------------------------------------------------
     candidates: list[dict] = []
     skipped_no_ohlc = skipped_no_delivery = 0
 
@@ -180,19 +151,15 @@ def main() -> int:
         ema200    = float(last["ema200"])
         pct_chg   = float(last["pct_change"])
 
-        # F1: closed up
-        if pct_chg <= args.min_pct_change:
+        if pct_chg <= min_pct_change:
             continue
-        # F2: above 200 EMA
-        if args.require_above_200ema and price < ema200:
+        if require_above_200ema and price < ema200:
             continue
-        # F3: volume vs yesterday
         if vol_prev <= 0:
             continue
         vol_ratio_1d = vol_today / vol_prev
-        if vol_ratio_1d < args.min_vol_ratio_1d:
+        if vol_ratio_1d < min_vol_ratio_1d:
             continue
-        # F4-5: delivery quantity + times
         if symbol not in delivery_df.index:
             skipped_no_delivery += 1
             continue
@@ -200,9 +167,9 @@ def main() -> int:
         deliv_qty   = float(d["deliv_today"])
         deliv_times = float(d["deliv_ratio"])
         deliv_pct   = float(d.get("deliv_pct", 0))
-        if deliv_qty < args.min_delivery_qty:
+        if deliv_qty < min_delivery_qty:
             continue
-        if deliv_times < args.min_delivery_times:
+        if deliv_times < min_delivery_times:
             continue
 
         candidates.append({
@@ -215,58 +182,116 @@ def main() -> int:
             "deliv_times":  round(deliv_times, 2),
             "deliv_pct":    round(deliv_pct, 1),
             "ema200":       round(ema200, 2),
+            "sector":       get_sector(symbol),
         })
 
-    # Rank by delivery times (strongest institutional buying signal)
     candidates.sort(key=lambda c: c["deliv_times"], reverse=True)
+    log.info("Scan complete in %.1fs — %d candidates", time.time() - t0, len(candidates))
 
-    log.info("Scan complete in %.1fs", time.time() - t0)
-    log.info("  Candidates:        %d", len(candidates))
-    log.info("  Skipped (no OHLC): %d", skipped_no_ohlc)
-    log.info("  Skipped (no deliv data): %d", skipped_no_delivery)
+    text = _format_report(candidates, top_n, min_pct_change, min_delivery_qty,
+                          min_delivery_times, min_vol_ratio_1d)
+    return candidates, text
 
-    # ---- 5. Format and send -----------------------------------------
+
+def _esc(s) -> str:
+    """Minimal HTML escape for Telegram HTML parse mode."""
+    return (str(s).replace("&", "&amp;")
+                  .replace("<", "&lt;")
+                  .replace(">", "&gt;"))
+
+
+def _format_report(candidates, top_n, min_pct_change, min_delivery_qty,
+                   min_delivery_times, min_vol_ratio_1d) -> str:
     today = datetime.now().strftime("%a, %d %b %Y")
     if not candidates:
-        text = (f"📊 *Delivery Scanner — {today}*\n\n"
-                f"No stocks matched the filters today.\n"
-                f"_Filters: %chg>{args.min_pct_change}, deliv≥{args.min_delivery_qty} "
-                f"shares, deliv×≥{args.min_delivery_times}, vol≥{args.min_vol_ratio_1d}× "
-                f"prev day, above 200 EMA_")
-    else:
-        top = candidates[:args.top_n]
-        lines = [
-            f"📊 *Delivery Scanner — {today}*",
-            f"Found *{len(candidates)}* setups (showing top {len(top)})",
-            f"_Filters: %chg>{args.min_pct_change}, deliv≥{args.min_delivery_qty} shares,_",
-            f"_deliv×≥{args.min_delivery_times}, vol≥{args.min_vol_ratio_1d}× prev day, above 200 EMA_",
-            "",
-        ]
-        for i, c in enumerate(top, 1):
-            lines.append(
-                f"*{i}. {c['symbol']}*  ₹{c['price']}  ({c['pct_change']:+.1f}%)\n"
-                f"   📦 Deliv *{c['deliv_times']}×*  ({c['deliv_qty']:,} sh, {c['deliv_pct']}%)\n"
-                f"   📈 Vol *{c['vol_ratio_1d']}×* prev day  |  200 EMA ₹{c['ema200']}\n"
-            )
-        lines.append("\n_⚠️ Do your fundamental check before entry. Educational only._")
-        text = "\n".join(lines)
+        return _empty_message(min_pct_change, min_delivery_qty,
+                              min_delivery_times, min_vol_ratio_1d)
+    top = candidates[:top_n]
+    lines = [
+        f"📊 <b>Delivery Scanner — {today}</b>",
+        f"Found <b>{len(candidates)}</b> setups (showing top {len(top)})",
+        f"<i>Filters: %chg&gt;{min_pct_change}, deliv≥{min_delivery_qty} shares,</i>",
+        f"<i>deliv×≥{min_delivery_times}, vol≥{min_vol_ratio_1d}× prev day, above 200 EMA</i>",
+        "",
+    ]
+    for i, c in enumerate(top, 1):
+        sym = _esc(c["symbol"])
+        sector_tag = f"  <i>{_esc(c['sector'])}</i>" if c.get("sector") else ""
+        tv_url = f"https://in.tradingview.com/chart/?symbol=NSE%3A{c['symbol']}"
+        sc_url = f"https://www.screener.in/company/{c['symbol']}/"
+        lines.append(
+            f"<b>{i}. {sym}</b>{sector_tag}  ₹{c['price']}  ({c['pct_change']:+.1f}%)\n"
+            f"   📦 Deliv <b>{c['deliv_times']}×</b>  ({c['deliv_qty']:,} sh, {c['deliv_pct']}%)\n"
+            f"   📈 Vol <b>{c['vol_ratio_1d']}×</b> prev day  |  200 EMA ₹{c['ema200']}\n"
+            f"   📊 <a href=\"{tv_url}\">Chart</a>  |  "
+            f"📋 <a href=\"{sc_url}\">Fundamentals</a>\n"
+        )
+    lines.append("\n<i>⚠️ Do your fundamental check before entry. Educational only.</i>")
+    return "\n".join(lines)
 
-    # Load Telegram credentials from config.yaml (or env vars via that loader)
+
+def _empty_message(min_pct_change, min_delivery_qty, min_delivery_times,
+                   min_vol_ratio_1d, note: str = "No stocks matched the filters today.") -> str:
+    today = datetime.now().strftime("%a, %d %b %Y")
+    return (f"📊 <b>Delivery Scanner — {today}</b>\n\n"
+            f"{_esc(note)}\n"
+            f"<i>Filters: %chg&gt;{min_pct_change}, deliv≥{min_delivery_qty} "
+            f"shares, deliv×≥{min_delivery_times}, vol≥{min_vol_ratio_1d}× "
+            f"prev day, above 200 EMA</i>")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Simple delivery+volume scanner — Telegram alerter")
+    parser.add_argument("--universe", default="nifty500.csv")
+    parser.add_argument("--min-pct-change", type=float, default=0.0)
+    parser.add_argument("--min-delivery-qty", type=int, default=10000)
+    parser.add_argument("--min-delivery-times", type=float, default=3.0)
+    parser.add_argument("--delivery-lookback", type=int, default=20)
+    parser.add_argument("--min-vol-ratio-1d", type=float, default=3.0)
+    parser.add_argument("--require-above-200ema", action="store_true", default=True)
+    parser.add_argument("--no-above-200ema", dest="require_above_200ema", action="store_false")
+    parser.add_argument("--bhavcopy-days", type=int, default=25)
+    parser.add_argument("--cache-dir", default=".cache/bhavcopy")
+    parser.add_argument("--config", default="config.yaml",
+                        help="Read Telegram credentials from this YAML")
+    parser.add_argument("--top-n", type=int, default=25)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--no-cache", action="store_true")
+    args = parser.parse_args()
+
+    setup_logging()
+    log = logging.getLogger("scanner")
+    log.info("=" * 70)
+    log.info("Delivery + Volume Scanner (CLI)")
+    log.info("=" * 70)
+
+    _, text = run_scan(
+        universe_csv        = args.universe,
+        min_pct_change      = args.min_pct_change,
+        min_delivery_qty    = args.min_delivery_qty,
+        min_delivery_times  = args.min_delivery_times,
+        min_vol_ratio_1d    = args.min_vol_ratio_1d,
+        require_above_200ema= args.require_above_200ema,
+        bhavcopy_days       = args.bhavcopy_days,
+        cache_dir           = args.cache_dir,
+        top_n               = args.top_n,
+        no_cache            = args.no_cache,
+    )
+
     bot_token = chat_id = None
     try:
         cfg = load_config(args.config)
         bot_token = cfg.telegram.bot_token
         chat_id = cfg.telegram.chat_id
     except Exception as e:
-        log.warning("Could not load Telegram config (%s): %s",
-                    args.config, e)
+        log.warning("Could not load Telegram config (%s): %s", args.config, e)
 
     if args.dry_run:
         print("\n" + text)
     else:
         send_telegram(text, bot_token, chat_id)
         log.info("Report sent.")
-
     return 0
 
 

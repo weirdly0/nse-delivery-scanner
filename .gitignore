@@ -8,6 +8,7 @@ __pycache__/
 # Local config / secrets
 .env
 config.local.yaml
+local.settings.json
 
 # Editor / OS junk
 .DS_Store

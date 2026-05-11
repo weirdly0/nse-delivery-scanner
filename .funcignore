@@ -1,0 +1,15 @@
+.git*
+.vscode
+.idea
+__pycache__
+*.pyc
+.cache/
+.env
+.venv
+venv/
+local.settings.json
+.DS_Store
+README.md
+.github/
+results_*.json
+*.log
