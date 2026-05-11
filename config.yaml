@@ -1,0 +1,14 @@
+# =====================================================================
+#  NSE Delivery + Volume Scanner — Configuration
+# =====================================================================
+#  All scanner filters are passed via CLI flags on delivery_scanner.py.
+#  This file just holds Telegram credentials.
+#
+#  Recommended: leave bot_token blank here and set the env vars
+#  TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID instead — env vars always
+#  override the values in this file.
+# =====================================================================
+
+telegram:
+  bot_token: ""    # set via env var TELEGRAM_BOT_TOKEN
+  chat_id: ""      # set via env var TELEGRAM_CHAT_ID
