@@ -20,6 +20,9 @@ App settings expected:
   BREAKOUT_LOOKBACK    (optional, default 30)
   BREAKOUT_TOLERANCE   (optional, default 0.01)
   SKIP_CIRCUIT         (optional, "true"/"false", default true)
+  MIN_TURNOVER_CR      (optional, default 10.0 — backtested liquidity lever)
+  MIN_PRICE            (optional, default 30.0 — anti-penny)
+  TRADE_BUDGET         (optional, default 1000.0 — tradeable vs observe split)
 
 All new filter settings have safe defaults, so no App Settings change is
 required to deploy this update.
@@ -112,6 +115,9 @@ def daily_scanner(timer: func.TimerRequest) -> None:
             breakout_lookback    = _env_int("BREAKOUT_LOOKBACK",     30),
             breakout_tolerance   = _env_float("BREAKOUT_TOLERANCE",  0.01),
             skip_circuit         = _env_bool("SKIP_CIRCUIT",         True),
+            min_turnover_cr      = _env_float("MIN_TURNOVER_CR",     10.0),
+            min_price            = _env_float("MIN_PRICE",           30.0),
+            trade_budget         = _env_float("TRADE_BUDGET",        1000.0),
             bhavcopy_days        = _env_int("BHAVCOPY_DAYS",         25),
             top_n                = _env_int("TOP_N",                 25),
             cache_dir            = cache_dir,

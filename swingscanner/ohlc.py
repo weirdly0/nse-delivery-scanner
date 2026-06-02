@@ -156,6 +156,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ema100"] = df["Close"].ewm(span=100, adjust=False).mean()
     df["ema200"] = df["Close"].ewm(span=200, adjust=False).mean()
     df["vol_avg20"] = df["Volume"].rolling(20).mean()
+    # 20-day average daily turnover (price*volume) in ₹ crore — a liquidity
+    # gauge. Backtest: a ~₹10cr floor flipped the strategy from losing to
+    # winning by screening out thin/illiquid junk breakouts.
+    df["turnover_cr"] = (df["Close"] * df["Volume"]).rolling(20).mean() / 1e7
     df["pct_change"] = df["Close"].pct_change() * 100
     return df
 

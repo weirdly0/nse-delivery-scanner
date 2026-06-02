@@ -111,6 +111,9 @@ def run_scan(
     breakout_lookback: int = 30,    # backtested best of 15/30/45/60/90 (backtest_breakout.py)
     breakout_tolerance: float = 0.01,  # backtested best of 0.00/0.01/0.02/0.03 (backtest_params.py)
     skip_circuit: bool = True,
+    min_turnover_cr: float = 10.0,   # avg 20d turnover floor — backtested liquidity lever
+    min_price: float = 30.0,         # anti-penny floor
+    trade_budget: float = 1000.0,    # splits alerts into 🟢 tradeable vs 👁 observe-only
     bhavcopy_days: int = 25,
     cache_dir: str = ".cache/bhavcopy",
     top_n: int = 25,
@@ -123,9 +126,10 @@ def run_scan(
     Azure Function) wrap this and decide what to do with the output.
     """
     log = logging.getLogger("scanner")
-    log.info("Filters: %%chg>%.1f | deliv_qty>%d | deliv×≥%.1f | vol/prev≥%.1f | 200EMA=%s",
+    log.info("Filters: %%chg>%.1f | deliv_qty>%d | deliv×≥%.1f | vol/prev≥%.1f | "
+             "200EMA=%s | turnover≥%.0fcr | price≥%.0f",
              min_pct_change, min_delivery_qty, min_delivery_times,
-             min_vol_ratio_1d, require_above_200ema)
+             min_vol_ratio_1d, require_above_200ema, min_turnover_cr, min_price)
 
     t0 = time.time()
     symbols = load_universe(universe_csv)
@@ -172,7 +176,13 @@ def run_scan(
         ema200    = float(last["ema200"])
         pct_chg   = float(last["pct_change"])
 
+        turnover_cr = float(last["turnover_cr"]) if last["turnover_cr"] == last["turnover_cr"] else 0.0
+
         if pct_chg <= min_pct_change:
+            continue
+        if price < min_price:                       # skip penny stocks
+            continue
+        if turnover_cr < min_turnover_cr:           # liquidity floor (backtested lever)
             continue
         if require_above_200ema and price < ema200:
             continue
@@ -211,6 +221,7 @@ def run_scan(
             "deliv_times":  round(deliv_times, 2),
             "deliv_pct":    round(deliv_pct, 1),
             "ema200":       round(ema200, 2),
+            "turnover_cr":  round(turnover_cr, 1),
             "sector":       get_sector(symbol),
         })
 
@@ -247,7 +258,8 @@ def run_scan(
     log.info("Skipped %d circuit-locked name(s)", skipped_circuit)
 
     text = _format_report(candidates, top_n, min_pct_change, min_delivery_qty,
-                          min_delivery_times, min_vol_ratio_1d, large_cap_cr)
+                          min_delivery_times, min_vol_ratio_1d, large_cap_cr,
+                          trade_budget, min_turnover_cr, min_price)
     return candidates, text
 
 
@@ -265,44 +277,70 @@ def _fmt_mcap(mc) -> str:
     return f"MCap ₹{mc:,.0f} cr"
 
 
+def _stock_block(i, c, trade_budget) -> str:
+    sym = _esc(c["symbol"])
+    sector_tag = f"  <i>{_esc(c['sector'])}</i>" if c.get("sector") else ""
+    target = c.get("target_pct", 30)
+    is_large = c.get("large_cap", False)
+    cap_label = "large-cap · trail from +20%" if is_large else "small/mid-cap"
+    mcap_str = _fmt_mcap(c.get("market_cap_cr"))
+    price = c["price"]
+    turn = c.get("turnover_cr", 0)
+    # affordability line for the configured per-trade budget
+    if price <= trade_budget and price > 0:
+        shares = int(trade_budget // price)
+        afford = f"🟢 ₹{trade_budget:,.0f} buys <b>{shares} sh</b>"
+    else:
+        afford = f"👁 observe — 1 sh = ₹{price:,.0f}"
+    # Plain TradingView web URL — always works, opens chart in browser.
+    tv_url = f"https://in.tradingview.com/chart/?symbol=NSE%3A{c['symbol']}"
+    sc_url = f"https://www.screener.in/company/{c['symbol']}/"
+    return (
+        f"<b>{i}. {sym}</b>{sector_tag}  ₹{price}  ({c['pct_change']:+.1f}%)\n"
+        f"   📦 Deliv <b>{c['deliv_times']}×</b>  ({c['deliv_qty']:,} sh, {c['deliv_pct']}%)\n"
+        f"   📈 Vol <b>{c['vol_ratio_1d']}×</b> prev  |  Turnover ₹{turn}cr/day\n"
+        f"   🎯 Target ~<b>{target}%</b>  ({cap_label})  |  {mcap_str}\n"
+        f"   {afford}\n"
+        f"   📊 <a href=\"{tv_url}\">Chart</a>  |  "
+        f"📋 <a href=\"{sc_url}\">Fundamentals</a>\n"
+    )
+
+
 def _format_report(candidates, top_n, min_pct_change, min_delivery_qty,
                    min_delivery_times, min_vol_ratio_1d,
-                   large_cap_cr: float = 10000.0) -> str:
+                   large_cap_cr: float = 10000.0, trade_budget: float = 1000.0,
+                   min_turnover_cr: float = 10.0, min_price: float = 30.0) -> str:
     today = datetime.now().strftime("%a, %d %b %Y")
     if not candidates:
         return _empty_message(min_pct_change, min_delivery_qty,
                               min_delivery_times, min_vol_ratio_1d)
     top = candidates[:top_n]
     big_cr = f"{large_cap_cr:,.0f}"
+    # split: affordable for the per-trade budget vs observe-only (pricey)
+    tradeable = [c for c in top if 0 < c["price"] <= trade_budget]
+    observe   = [c for c in top if c["price"] > trade_budget]
     lines = [
         f"📊 <b>Delivery Scanner — {today}</b>",
         f"Found <b>{len(candidates)}</b> setups (showing top {len(top)})",
-        f"<i>Filters: %chg&gt;{min_pct_change}, deliv≥{min_delivery_qty} shares,</i>",
-        f"<i>deliv×≥{min_delivery_times}, vol≥{min_vol_ratio_1d}× prev day,</i>",
-        f"<i>above 200 EMA, base/ATH breakout, MCap≥100 cr</i>",
-        f"<i>🎯 Target ~30% · large-cap (≥₹{big_cr} cr): consider trailing from +20%</i>",
-        "",
+        f"<i>Filters: %chg&gt;{min_pct_change}, deliv≥{min_delivery_qty} sh, "
+        f"deliv×≥{min_delivery_times}, vol≥{min_vol_ratio_1d}×,</i>",
+        f"<i>above 200 EMA, base/ATH breakout, turnover≥₹{min_turnover_cr:.0f}cr/day, "
+        f"price≥₹{min_price:.0f} (no penny)</i>",
+        f"<i>🎯 Target ~30% · large-cap (≥₹{big_cr} cr): trail from +20%</i>",
     ]
-    for i, c in enumerate(top, 1):
-        sym = _esc(c["symbol"])
-        sector_tag = f"  <i>{_esc(c['sector'])}</i>" if c.get("sector") else ""
-        target = c.get("target_pct", 30)
-        is_large = c.get("large_cap", False)
-        cap_label = "large-cap · trail from +20%" if is_large else "small/mid-cap"
-        mcap_str = _fmt_mcap(c.get("market_cap_cr"))
-        # Plain TradingView web URL — always works, opens chart in browser.
-        # (Deep-link to mobile app didn't reliably navigate to the symbol;
-        # reverted to web-only after testing.)
-        tv_url = f"https://in.tradingview.com/chart/?symbol=NSE%3A{c['symbol']}"
-        sc_url = f"https://www.screener.in/company/{c['symbol']}/"
-        lines.append(
-            f"<b>{i}. {sym}</b>{sector_tag}  ₹{c['price']}  ({c['pct_change']:+.1f}%)\n"
-            f"   📦 Deliv <b>{c['deliv_times']}×</b>  ({c['deliv_qty']:,} sh, {c['deliv_pct']}%)\n"
-            f"   📈 Vol <b>{c['vol_ratio_1d']}×</b> prev day  |  200 EMA ₹{c['ema200']}\n"
-            f"   🎯 Target ~<b>{target}%</b>  |  {mcap_str} ({cap_label})\n"
-            f"   📊 <a href=\"{tv_url}\">Chart</a>  |  "
-            f"📋 <a href=\"{sc_url}\">Fundamentals</a>\n"
-        )
+    n = 0
+    if tradeable:
+        lines.append(f"\n🟢 <b>TRADEABLE</b> (≤ ₹{trade_budget:,.0f} budget) — "
+                     f"{len(tradeable)} stocks")
+        for c in tradeable:
+            n += 1
+            lines.append(_stock_block(n, c, trade_budget))
+    if observe:
+        lines.append(f"\n👁 <b>OBSERVE / LEARN</b> (quality breakouts, above your "
+                     f"₹{trade_budget:,.0f} budget) — {len(observe)} stocks")
+        for c in observe:
+            n += 1
+            lines.append(_stock_block(n, c, trade_budget))
     lines.append("\n<i>⚠️ Do your fundamental check before entry. Educational only.</i>")
     return "\n".join(lines)
 
@@ -343,6 +381,14 @@ def main() -> int:
                              "(0.01 backtested best vs 0.00/0.02/0.03)")
     parser.add_argument("--keep-circuit", dest="skip_circuit", action="store_false",
                         default=True, help="Don't filter out circuit-locked stocks")
+    parser.add_argument("--min-turnover-cr", type=float, default=10.0,
+                        help="Min avg 20d turnover ₹cr/day (10 = backtested "
+                             "liquidity lever; the single biggest improvement)")
+    parser.add_argument("--min-price", type=float, default=30.0,
+                        help="Skip penny stocks below this price")
+    parser.add_argument("--trade-budget", type=float, default=1000.0,
+                        help="Per-trade budget — splits alerts into 🟢 tradeable "
+                             "(≤ budget) vs 👁 observe-only (pricier)")
     parser.add_argument("--bhavcopy-days", type=int, default=25)
     parser.add_argument("--cache-dir", default=".cache/bhavcopy")
     parser.add_argument("--config", default="config.yaml",
@@ -371,6 +417,9 @@ def main() -> int:
         breakout_lookback   = args.breakout_lookback,
         breakout_tolerance  = args.breakout_tolerance,
         skip_circuit        = args.skip_circuit,
+        min_turnover_cr     = args.min_turnover_cr,
+        min_price           = args.min_price,
+        trade_budget        = args.trade_budget,
         bhavcopy_days       = args.bhavcopy_days,
         cache_dir           = args.cache_dir,
         top_n               = args.top_n,
