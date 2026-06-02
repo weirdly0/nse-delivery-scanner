@@ -7,6 +7,12 @@ Filters (all configurable via CLI flags):
   - Delivery Times >= 3                (--min-delivery-times)
   - Close above 200 EMA on daily       (--no-above-200ema to disable)
   - Today's Volume >= 3x previous day  (--min-vol-ratio-1d)
+  - Base / all-time-high breakout      (--no-breakout, --breakout-lookback)
+  - Market cap >= 100 cr               (--min-market-cap-cr)
+  - Skip circuit-locked stocks         (--keep-circuit to disable)
+
+Each alert tags a suggested target: large-cap (>= --large-cap-cr) -> ~20%
+then trail; smaller -> ~30% (per the strategy videos).
 
 Reads symbols from CSV, pulls NSE bhavcopy for delivery data + yfinance for
 OHLC, applies filters, sends ranked shortlist to your Telegram bot.
@@ -31,8 +37,11 @@ import requests
 from swingscanner.config import load_config
 from swingscanner.universe import load_universe
 from swingscanner.nse_data import BhavcopyStore, compute_delivery_ratios
-from swingscanner.ohlc import fetch_ohlc_bulk, add_indicators
-from swingscanner.sectors import get_sector
+from swingscanner.ohlc import (
+    fetch_ohlc_bulk, add_indicators, enrich_market_caps,
+    is_circuit_locked, is_breakout,
+)
+from swingscanner.sectors import get_sector, enrich_sectors
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -68,6 +77,12 @@ def send_telegram(text: str, bot_token: str | None, chat_id: str | None) -> None
     if cur:
         chunks.append(cur)
 
+    # When a report spans multiple Telegram messages, prefix each chunk
+    # with "Part X/Y" so the reader knows it's intentional, not noise.
+    if len(chunks) > 1:
+        n = len(chunks)
+        chunks = [f"<i>📄 Part {i+1}/{n}</i>\n\n{c}" for i, c in enumerate(chunks)]
+
     for chunk in chunks:
         try:
             r = requests.post(url, data={
@@ -90,6 +105,12 @@ def run_scan(
     delivery_lookback: int = 20,
     min_vol_ratio_1d: float = 3.0,
     require_above_200ema: bool = True,
+    min_market_cap_cr: float = 100.0,
+    large_cap_cr: float = 10000.0,
+    require_breakout: bool = True,
+    breakout_lookback: int = 30,    # backtested best of 15/30/45/60/90 (backtest_breakout.py)
+    breakout_tolerance: float = 0.01,  # backtested best of 0.00/0.01/0.02/0.03 (backtest_params.py)
+    skip_circuit: bool = True,
     bhavcopy_days: int = 25,
     cache_dir: str = ".cache/bhavcopy",
     top_n: int = 25,
@@ -134,7 +155,7 @@ def run_scan(
     ohlc_cache = fetch_ohlc_bulk(symbols, days=250)
 
     candidates: list[dict] = []
-    skipped_no_ohlc = skipped_no_delivery = 0
+    skipped_no_ohlc = skipped_no_delivery = skipped_circuit = 0
 
     for symbol in symbols:
         df = ohlc_cache.get(symbol)
@@ -154,6 +175,14 @@ def run_scan(
         if pct_chg <= min_pct_change:
             continue
         if require_above_200ema and price < ema200:
+            continue
+        # Skip untradeable circuit-locked names (Shiv Om / GTX in the video).
+        if skip_circuit and is_circuit_locked(df):
+            skipped_circuit += 1
+            continue
+        # Require a base / all-time-high breakout, not just "above 200 EMA".
+        if require_breakout and not is_breakout(df, breakout_lookback,
+                                                breakout_tolerance):
             continue
         if vol_prev <= 0:
             continue
@@ -188,8 +217,37 @@ def run_scan(
     candidates.sort(key=lambda c: c["deliv_times"], reverse=True)
     log.info("Scan complete in %.1fs — %d candidates", time.time() - t0, len(candidates))
 
+    # Enrich sector + market cap via yfinance (parallel, only for the small
+    # candidate list). Then apply the market-cap floor and the 20%/30%
+    # target tier by size.
+    if candidates:
+        t1 = time.time()
+        enrich_sectors(candidates)
+        enrich_market_caps(candidates)
+        log.info("Sector + market-cap enrichment: %.1fs", time.time() - t1)
+
+        kept: list[dict] = []
+        for c in candidates:
+            mc = c.get("market_cap_cr")
+            # Drop only on a *known* sub-floor cap; keep unknowns (data may
+            # fail) but treat them as small/mid for the target tier.
+            if mc is not None and mc < min_market_cap_cr:
+                continue
+            # Flat +30% target for everyone (best backtested expectancy); large
+            # caps additionally flagged to trail from +20% (creator's caution).
+            c["target_pct"] = 30
+            c["large_cap"] = mc is not None and mc >= large_cap_cr
+            kept.append(c)
+        dropped = len(candidates) - len(kept)
+        if dropped:
+            log.info("Dropped %d candidate(s) below ₹%.0f cr market cap",
+                     dropped, min_market_cap_cr)
+        candidates = kept
+
+    log.info("Skipped %d circuit-locked name(s)", skipped_circuit)
+
     text = _format_report(candidates, top_n, min_pct_change, min_delivery_qty,
-                          min_delivery_times, min_vol_ratio_1d)
+                          min_delivery_times, min_vol_ratio_1d, large_cap_cr)
     return candidates, text
 
 
@@ -200,29 +258,48 @@ def _esc(s) -> str:
                   .replace(">", "&gt;"))
 
 
+def _fmt_mcap(mc) -> str:
+    """Human-readable market cap in crores, or 'n/a' when unknown."""
+    if mc is None:
+        return "MCap n/a"
+    return f"MCap ₹{mc:,.0f} cr"
+
+
 def _format_report(candidates, top_n, min_pct_change, min_delivery_qty,
-                   min_delivery_times, min_vol_ratio_1d) -> str:
+                   min_delivery_times, min_vol_ratio_1d,
+                   large_cap_cr: float = 10000.0) -> str:
     today = datetime.now().strftime("%a, %d %b %Y")
     if not candidates:
         return _empty_message(min_pct_change, min_delivery_qty,
                               min_delivery_times, min_vol_ratio_1d)
     top = candidates[:top_n]
+    big_cr = f"{large_cap_cr:,.0f}"
     lines = [
         f"📊 <b>Delivery Scanner — {today}</b>",
         f"Found <b>{len(candidates)}</b> setups (showing top {len(top)})",
         f"<i>Filters: %chg&gt;{min_pct_change}, deliv≥{min_delivery_qty} shares,</i>",
-        f"<i>deliv×≥{min_delivery_times}, vol≥{min_vol_ratio_1d}× prev day, above 200 EMA</i>",
+        f"<i>deliv×≥{min_delivery_times}, vol≥{min_vol_ratio_1d}× prev day,</i>",
+        f"<i>above 200 EMA, base/ATH breakout, MCap≥100 cr</i>",
+        f"<i>🎯 Target ~30% · large-cap (≥₹{big_cr} cr): consider trailing from +20%</i>",
         "",
     ]
     for i, c in enumerate(top, 1):
         sym = _esc(c["symbol"])
         sector_tag = f"  <i>{_esc(c['sector'])}</i>" if c.get("sector") else ""
+        target = c.get("target_pct", 30)
+        is_large = c.get("large_cap", False)
+        cap_label = "large-cap · trail from +20%" if is_large else "small/mid-cap"
+        mcap_str = _fmt_mcap(c.get("market_cap_cr"))
+        # Plain TradingView web URL — always works, opens chart in browser.
+        # (Deep-link to mobile app didn't reliably navigate to the symbol;
+        # reverted to web-only after testing.)
         tv_url = f"https://in.tradingview.com/chart/?symbol=NSE%3A{c['symbol']}"
         sc_url = f"https://www.screener.in/company/{c['symbol']}/"
         lines.append(
             f"<b>{i}. {sym}</b>{sector_tag}  ₹{c['price']}  ({c['pct_change']:+.1f}%)\n"
             f"   📦 Deliv <b>{c['deliv_times']}×</b>  ({c['deliv_qty']:,} sh, {c['deliv_pct']}%)\n"
             f"   📈 Vol <b>{c['vol_ratio_1d']}×</b> prev day  |  200 EMA ₹{c['ema200']}\n"
+            f"   🎯 Target ~<b>{target}%</b>  |  {mcap_str} ({cap_label})\n"
             f"   📊 <a href=\"{tv_url}\">Chart</a>  |  "
             f"📋 <a href=\"{sc_url}\">Fundamentals</a>\n"
         )
@@ -251,6 +328,21 @@ def main() -> int:
     parser.add_argument("--min-vol-ratio-1d", type=float, default=3.0)
     parser.add_argument("--require-above-200ema", action="store_true", default=True)
     parser.add_argument("--no-above-200ema", dest="require_above_200ema", action="store_false")
+    parser.add_argument("--min-market-cap-cr", type=float, default=100.0,
+                        help="Drop candidates below this market cap (₹ crore)")
+    parser.add_argument("--large-cap-cr", type=float, default=10000.0,
+                        help="At/above this MCap → 20%% target tier, else 30%%")
+    parser.add_argument("--require-breakout", action="store_true", default=True)
+    parser.add_argument("--no-breakout", dest="require_breakout", action="store_false",
+                        help="Disable the base/all-time-high breakout filter")
+    parser.add_argument("--breakout-lookback", type=int, default=30,
+                        help="Sessions in the base whose high must be broken "
+                             "(30 backtested best vs 15/45/60/90)")
+    parser.add_argument("--breakout-tolerance", type=float, default=0.01,
+                        help="Allow close within this fraction below the base high "
+                             "(0.01 backtested best vs 0.00/0.02/0.03)")
+    parser.add_argument("--keep-circuit", dest="skip_circuit", action="store_false",
+                        default=True, help="Don't filter out circuit-locked stocks")
     parser.add_argument("--bhavcopy-days", type=int, default=25)
     parser.add_argument("--cache-dir", default=".cache/bhavcopy")
     parser.add_argument("--config", default="config.yaml",
@@ -273,6 +365,12 @@ def main() -> int:
         min_delivery_times  = args.min_delivery_times,
         min_vol_ratio_1d    = args.min_vol_ratio_1d,
         require_above_200ema= args.require_above_200ema,
+        min_market_cap_cr   = args.min_market_cap_cr,
+        large_cap_cr        = args.large_cap_cr,
+        require_breakout    = args.require_breakout,
+        breakout_lookback   = args.breakout_lookback,
+        breakout_tolerance  = args.breakout_tolerance,
+        skip_circuit        = args.skip_circuit,
         bhavcopy_days       = args.bhavcopy_days,
         cache_dir           = args.cache_dir,
         top_n               = args.top_n,

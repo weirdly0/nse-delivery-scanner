@@ -182,3 +182,58 @@ def fetch_market_cap_cr(symbol: str) -> Optional[float]:
         return float(mc) / 1e7
     except Exception:
         return None
+
+
+def enrich_market_caps(candidates: list[dict], max_workers: int = 8) -> None:
+    """Fetch market cap (₹ crore) in parallel for each candidate.
+
+    Mutates the list in-place, setting 'market_cap_cr' to a float or None
+    (None = couldn't fetch). Same parallel pattern as enrich_sectors.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not candidates:
+        return
+    syms = [c["symbol"] for c in candidates]
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        caps = list(pool.map(fetch_market_cap_cr, syms))
+    for c, mc in zip(candidates, caps):
+        c["market_cap_cr"] = mc
+
+
+def is_circuit_locked(df: pd.DataFrame, lookback: int = 20,
+                      frozen_frac: float = 0.25, eps: float = 0.001) -> bool:
+    """Heuristic detector for upper/lower-circuit (untradeable) stocks.
+
+    A circuit-locked session has (almost) no intraday range: High ≈ Low.
+    If today is frozen, or a large fraction of the last `lookback` sessions
+    were frozen, the stock trades only by circuit (like the Shiv Om / GTX
+    names in the video) and we skip it.
+    """
+    recent = df.tail(lookback)
+    n = len(recent)
+    if n == 0:
+        return False
+    rng_frac = (recent["High"] - recent["Low"]) / recent["Close"].clip(lower=1e-9)
+    frozen = int((rng_frac < eps).sum())
+    today_frozen = bool(rng_frac.iloc[-1] < eps)
+    return today_frozen or (frozen / n >= frozen_frac)
+
+
+def is_breakout(df: pd.DataFrame, lookback: int = 60,
+                tolerance: float = 0.02) -> bool:
+    """True when today closes at/above the prior `lookback`-session high.
+
+    One rule covers both cases from the video: a *base breakout* (closing
+    above a multi-week sideways range) and an *all-time-high breakout* (the
+    same, when that range high is also the ATH). `tolerance` loosens 'above'
+    to 'within tolerance below', so a stock sitting right at the breakout
+    level still qualifies.
+    """
+    if len(df) < lookback + 1:
+        return False
+    prior_high = float(df["High"].iloc[-(lookback + 1):-1].max())
+    if prior_high <= 0:
+        return False
+    today_close = float(df["Close"].iloc[-1])
+    return today_close >= prior_high * (1.0 - tolerance)

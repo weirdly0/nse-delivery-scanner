@@ -136,3 +136,35 @@ SECTOR_MAPPING: dict[str, str] = {
 def get_sector(symbol: str) -> str:
     """Return the sector for a given NSE symbol, or empty string if unknown."""
     return SECTOR_MAPPING.get(symbol.upper(), "")
+
+
+def _fetch_sector_yf(symbol: str) -> str:
+    """Fall back to yfinance.Ticker.info — slow (~1-2s/call) but works for
+    almost all NSE-listed stocks."""
+    try:
+        import yfinance as yf
+        info = yf.Ticker(f"{symbol}.NS").info or {}
+        sector = info.get("sector") or info.get("industry") or ""
+        return str(sector).strip()
+    except Exception:
+        return ""
+
+
+def enrich_sectors(candidates: list[dict], max_workers: int = 8) -> None:
+    """
+    For candidates missing a sector, fetch it from yfinance in parallel.
+    Mutates the input list in-place by setting/updating the 'sector' key.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    to_fetch = [c for c in candidates if not c.get("sector")]
+    if not to_fetch:
+        return
+
+    syms = [c["symbol"] for c in to_fetch]
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        results = list(pool.map(_fetch_sector_yf, syms))
+
+    for c, sec in zip(to_fetch, results):
+        if sec:
+            c["sector"] = sec
