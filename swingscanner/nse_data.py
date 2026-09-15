@@ -31,6 +31,22 @@ COL_TRADED_QTY = " TTL_TRD_QNTY"
 COL_DELIV_QTY = " DELIV_QTY"
 COL_DELIV_PCT = " DELIV_PER"
 COL_DATE      = " DATE1"
+COL_OPEN      = " OPEN_PRICE"
+COL_HIGH      = " HIGH_PRICE"
+COL_LOW       = " LOW_PRICE"
+COL_PREV_CLOSE = " PREV_CLOSE"
+
+
+def validate_bhavcopy(df: pd.DataFrame, date: datetime) -> bool:
+    """Trust the date inside the file, never just its URL/cache filename."""
+    required = {COL_SYMBOL, COL_SERIES, COL_DATE, COL_CLOSE,
+                COL_TRADED_QTY, COL_DELIV_QTY, COL_DELIV_PCT,
+                COL_OPEN, COL_HIGH, COL_LOW, COL_PREV_CLOSE}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return False
+    dates = pd.to_datetime(df[COL_DATE].astype(str).str.strip(),
+                           format="%d-%b-%Y", errors="coerce")
+    return bool(dates.notna().all() and (dates.dt.date == date.date()).all())
 
 
 class BhavcopyStore:
@@ -50,13 +66,16 @@ class BhavcopyStore:
 
         if cache_file.exists():
             try:
-                return pd.read_csv(cache_file)
+                cached = pd.read_csv(cache_file)
+                if validate_bhavcopy(cached, date):
+                    return cached
+                log.warning("Rejecting invalid/misdated cache for %s", date_str)
             except Exception as e:
                 log.warning("Cache read failed for %s: %s", cache_file, e)
 
         # Try the live download
         df = self._download_bhavcopy(date)
-        if df is not None and not df.empty:
+        if validate_bhavcopy(df, date):
             df.to_csv(cache_file, index=False)
             return df
         return None
@@ -90,7 +109,7 @@ class BhavcopyStore:
         (holidays).
         """
         results: dict[datetime, pd.DataFrame] = {}
-        cursor = end_date
+        cursor = end_date.replace(hour=0, minute=0, second=0, microsecond=0)
         attempts = 0
         max_attempts = lookback_days * 2  # account for weekends + holidays
 
@@ -114,6 +133,7 @@ class BhavcopyStore:
 
 def compute_delivery_ratios(
     bhavs: dict[datetime, pd.DataFrame],
+    lookback: int = 20,
 ) -> Optional[pd.DataFrame]:
     """
     Given a dict of {date: bhavcopy_df}, return a DataFrame keyed by
@@ -124,19 +144,24 @@ def compute_delivery_ratios(
        close            : today's close
        deliv_pct        : today's delivery percentage
     """
+    if lookback < 1:
+        raise ValueError("Delivery lookback must be positive")
     if not bhavs:
         return None
 
     # Most-recent date is "today"
     sorted_dates = sorted(bhavs.keys(), reverse=True)
     today_date = sorted_dates[0]
-    prior_dates = sorted_dates[1:]
+    prior_dates = sorted_dates[1:lookback + 1]
+    if len(prior_dates) < lookback:
+        return None
 
     today_df = bhavs[today_date].copy()
     today_df = today_df[today_df[COL_SERIES].str.strip() == "EQ"]
 
     # Coerce numeric columns (NSE sometimes uses "-" for missing)
-    for col in (COL_DELIV_QTY, COL_TRADED_QTY, COL_DELIV_PCT, COL_CLOSE):
+    for col in (COL_DELIV_QTY, COL_TRADED_QTY, COL_DELIV_PCT, COL_CLOSE,
+                COL_OPEN, COL_HIGH, COL_LOW, COL_PREV_CLOSE):
         today_df[col] = pd.to_numeric(today_df[col], errors="coerce")
     today_df = today_df.dropna(subset=[COL_DELIV_QTY, COL_CLOSE])
 
@@ -156,11 +181,23 @@ def compute_delivery_ratios(
 
     hist_wide = pd.concat(history_frames, axis=1)
     avg_prior = hist_wide.mean(axis=1)
+    # A missing/zero baseline is not evidence of an infinite delivery spike.
+    avg_prior = avg_prior.where((hist_wide.count(axis=1) == lookback) & (avg_prior > 0))
 
+    previous_df = bhavs[prior_dates[0]]
+    previous_df = previous_df[previous_df[COL_SERIES].str.strip() == "EQ"]
+    previous_volume = pd.to_numeric(previous_df.set_index(COL_SYMBOL)[COL_TRADED_QTY],
+                                    errors="coerce")
     out = pd.DataFrame({
         "deliv_today":     today_df.set_index(COL_SYMBOL)[COL_DELIV_QTY],
         "deliv_pct":       today_df.set_index(COL_SYMBOL)[COL_DELIV_PCT],
         "close":           today_df.set_index(COL_SYMBOL)[COL_CLOSE],
+        "traded_qty":      today_df.set_index(COL_SYMBOL)[COL_TRADED_QTY],
+        "open":            today_df.set_index(COL_SYMBOL)[COL_OPEN],
+        "high":            today_df.set_index(COL_SYMBOL)[COL_HIGH],
+        "low":             today_df.set_index(COL_SYMBOL)[COL_LOW],
+        "prev_close":      today_df.set_index(COL_SYMBOL)[COL_PREV_CLOSE],
+        "previous_volume": previous_volume,
         "deliv_avg_prior": avg_prior,
     })
     out["deliv_ratio"] = out["deliv_today"] / out["deliv_avg_prior"]

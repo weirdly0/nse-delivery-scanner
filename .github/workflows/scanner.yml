@@ -1,12 +1,17 @@
 name: Daily Scanner
 
 on:
-  # 11:00 AM IST = 05:30 UTC, Mon-Fri
-  # Change to "30 12 * * 1-5" for 6 PM IST (after bhavcopy publishes)
-  schedule:
-    - cron: "30 5 * * 1-5"
-  # Allow manual runs from the Actions tab
+  # Azure owns the daily 22:30 IST schedule. Manual-only prevents duplicates.
   workflow_dispatch:
+    inputs:
+      as_of:
+        description: "Market session YYYY-MM-DD (blank = today in IST)"
+        required: false
+        type: string
+      dry_run:
+        description: "Preview without sending Telegram"
+        type: boolean
+        default: true
 
 jobs:
   scan:
@@ -32,4 +37,10 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python delivery_scanner.py
+          SCAN_AS_OF: ${{ inputs.as_of }}
+          SCAN_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          args=(--universe nse_equity.csv --top-n 500)
+          if [[ -n "$SCAN_AS_OF" ]]; then args+=(--as-of "$SCAN_AS_OF"); fi
+          if [[ "$SCAN_DRY_RUN" == "true" ]]; then args+=(--dry-run); fi
+          python delivery_scanner.py "${args[@]}"

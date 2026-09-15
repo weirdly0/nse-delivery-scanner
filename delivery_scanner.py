@@ -22,15 +22,17 @@ Usage:
   python delivery_scanner.py --dry-run           # print, don't send
   python delivery_scanner.py --min-delivery-times 5 --min-vol-ratio-1d 5
 
-Best run after 6 PM IST (NSE bhavcopy publishes then).
+Scheduled at 22:30 IST; requires validated same-session end-of-day data.
 """
 
 from __future__ import annotations
 import argparse
 import logging
+import math
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime, time as clock_time
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -39,9 +41,11 @@ from swingscanner.universe import load_universe
 from swingscanner.nse_data import BhavcopyStore, compute_delivery_ratios
 from swingscanner.ohlc import (
     fetch_ohlc_bulk, add_indicators, enrich_market_caps,
-    is_circuit_locked, is_breakout,
+    is_circuit_locked, is_breakout, with_nse_session,
 )
 from swingscanner.sectors import get_sector, enrich_sectors
+
+IST = ZoneInfo("Asia/Kolkata")
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -118,6 +122,7 @@ def run_scan(
     cache_dir: str = ".cache/bhavcopy",
     top_n: int = 25,
     no_cache: bool = False,
+    as_of: date | None = None,
 ) -> tuple[list[dict], str]:
     """
     Run the full scan and return (candidates_list, formatted_report_text).
@@ -126,6 +131,22 @@ def run_scan(
     Azure Function) wrap this and decide what to do with the output.
     """
     log = logging.getLogger("scanner")
+    now = datetime.now(IST)
+    session_date = as_of or now.date()
+    session_end = datetime.combine(session_date, clock_time())
+    if delivery_lookback < 1:
+        raise ValueError("Delivery lookback must be positive")
+
+    def pending(note):
+        return [], _empty_message(min_pct_change, min_delivery_qty,
+                                  min_delivery_times, min_vol_ratio_1d,
+                                  note=note, session_date=session_date)
+
+    if session_date > now.date() or (session_date == now.date() and
+                                    now.time() < clock_time(15, 30)):
+        return pending("Data pending — this market session has not closed yet.")
+    if session_date.weekday() >= 5:
+        return pending("No regular NSE session on this date (weekend).")
     log.info("Filters: %%chg>%.1f | deliv_qty>%d | deliv×≥%.1f | vol/prev≥%.1f | "
              "200EMA=%s | turnover≥%.0fcr | price≥%.0f",
              min_pct_change, min_delivery_qty, min_delivery_times,
@@ -140,30 +161,66 @@ def run_scan(
         import shutil
         shutil.rmtree(store.cache_dir, ignore_errors=True)
         store.cache_dir.mkdir(parents=True, exist_ok=True)
-    bhavs = store.get_history(end_date=datetime.now(),
-                              lookback_days=bhavcopy_days)
-    if not bhavs:
-        log.error("No bhavcopy data. NSE publishes around 6 PM IST.")
-        return [], _empty_message(min_pct_change, min_delivery_qty,
-                                  min_delivery_times, min_vol_ratio_1d,
-                                  note="Bhavcopy unavailable — run after 6 PM IST")
-    delivery_df = compute_delivery_ratios(bhavs)
+    # Do not silently walk back to yesterday when today's report is unavailable.
+    if store.get_day(session_end) is None:
+        log.warning("Validated NSE bhavcopy unavailable for %s", session_date)
+        return pending("Data pending — NSE bhavcopy unavailable for this date "
+                       "(publication delay, download failure, or market holiday). "
+                       "No older session substituted.")
+    bhavs = store.get_history(end_date=session_end,
+                              lookback_days=max(bhavcopy_days, delivery_lookback + 1))
+    if session_end not in bhavs:
+        return pending("Data pending — requested session missing from bhavcopy history.")
+    delivery_df = compute_delivery_ratios(bhavs, lookback=delivery_lookback)
     if delivery_df is None or delivery_df.empty:
         log.error("Could not compute delivery ratios.")
-        return [], _empty_message(min_pct_change, min_delivery_qty,
-                                  min_delivery_times, min_vol_ratio_1d,
-                                  note="Delivery data unavailable")
+        return pending("Data pending — insufficient valid delivery history.")
+    previous_session = sorted(bhavs)[-2].date()
     log.info("Delivery data: %d symbols", len(delivery_df))
 
-    log.info("Bulk-fetching OHLC...")
-    ohlc_cache = fetch_ohlc_bulk(symbols, days=250)
+    skipped_no_ohlc = skipped_no_delivery = skipped_circuit = 0
+    skipped_stale = 0
+    # NSE provides these daily filters for the whole universe in one file.
+    # Fetch expensive Yahoo history only for symbols that can still qualify.
+    shortlisted = []
+    for symbol in symbols:
+        if symbol not in delivery_df.index:
+            skipped_no_delivery += 1
+            continue
+        d = delivery_df.loc[symbol]
+        values = [float(d[k]) for k in ("close", "prev_close", "traded_qty",
+                                        "previous_volume", "deliv_today", "deliv_ratio")]
+        if not all(math.isfinite(v) and v > 0 for v in values):
+            skipped_no_delivery += 1
+            continue
+        price, prev_close, volume, prev_volume, delivery_qty, delivery_ratio = values
+        if ((price / prev_close - 1) * 100 <= min_pct_change or price < min_price or
+                volume / prev_volume < min_vol_ratio_1d or
+                delivery_qty < min_delivery_qty or delivery_ratio < min_delivery_times):
+            continue
+        shortlisted.append(symbol)
+    log.info("NSE daily filters: %d/%d symbols need chart history", len(shortlisted), len(symbols))
+    ohlc_cache = (fetch_ohlc_bulk(shortlisted, days=250, as_of=session_date)
+                  if shortlisted else {})
 
     candidates: list[dict] = []
-    skipped_no_ohlc = skipped_no_delivery = skipped_circuit = 0
 
-    for symbol in symbols:
+    for symbol in shortlisted:
         df = ohlc_cache.get(symbol)
         if df is None or len(df) < 200:
+            skipped_no_ohlc += 1
+            continue
+        if symbol not in delivery_df.index:
+            skipped_no_delivery += 1
+            continue
+        delivery = delivery_df.loc[symbol]
+        df = with_nse_session(df, delivery, session_date, previous_session)
+        if df is None:
+            skipped_stale += 1
+            log.warning("Skipping %s: missing prior OHLC session or invalid NSE EOD row for %s",
+                        symbol, session_date)
+            continue
+        if len(df) < 200:
             skipped_no_ohlc += 1
             continue
         df = add_indicators(df)
@@ -174,7 +231,7 @@ def run_scan(
         vol_today = float(last["Volume"])
         vol_prev  = float(prev["Volume"])
         ema200    = float(last["ema200"])
-        pct_chg   = float(last["pct_change"])
+        pct_chg   = (price / float(delivery["prev_close"]) - 1) * 100
 
         turnover_cr = float(last["turnover_cr"]) if last["turnover_cr"] == last["turnover_cr"] else 0.0
 
@@ -213,6 +270,7 @@ def run_scan(
 
         candidates.append({
             "symbol":       symbol,
+            "session_date": session_date.isoformat(),
             "price":        round(price, 2),
             "pct_change":   round(pct_chg, 2),
             "vol_today":    int(vol_today),
@@ -259,7 +317,14 @@ def run_scan(
 
     text = _format_report(candidates, top_n, min_pct_change, min_delivery_qty,
                           min_delivery_times, min_vol_ratio_1d, large_cap_cr,
-                          trade_budget, min_turnover_cr, min_price)
+                          trade_budget, min_turnover_cr, min_price,
+                          session_date=session_date)
+    if skipped_stale or skipped_no_ohlc or skipped_no_delivery:
+        text += (f"\n\n⚠️ Coverage incomplete: {skipped_stale} stale/misaligned OHLC; "
+                 f"{skipped_no_ohlc} missing/short OHLC; "
+                 f"{skipped_no_delivery} missing delivery history. These stocks were skipped.")
+    log.info("Session=%s previous=%s skipped_stale=%d skipped_ohlc=%d skipped_delivery=%d",
+             session_date, previous_session, skipped_stale, skipped_no_ohlc, skipped_no_delivery)
     return candidates, text
 
 
@@ -309,11 +374,13 @@ def _stock_block(i, c, trade_budget) -> str:
 def _format_report(candidates, top_n, min_pct_change, min_delivery_qty,
                    min_delivery_times, min_vol_ratio_1d,
                    large_cap_cr: float = 10000.0, trade_budget: float = 1000.0,
-                   min_turnover_cr: float = 10.0, min_price: float = 30.0) -> str:
-    today = datetime.now().strftime("%a, %d %b %Y")
+                   min_turnover_cr: float = 10.0, min_price: float = 30.0,
+                   session_date: date | None = None) -> str:
+    today = (session_date or datetime.now(IST).date()).strftime("%a, %d %b %Y")
     if not candidates:
         return _empty_message(min_pct_change, min_delivery_qty,
-                              min_delivery_times, min_vol_ratio_1d)
+                              min_delivery_times, min_vol_ratio_1d,
+                              session_date=session_date)
     top = candidates[:top_n]
     big_cr = f"{large_cap_cr:,.0f}"
     # split: affordable for the per-trade budget vs observe-only (pricey)
@@ -321,6 +388,7 @@ def _format_report(candidates, top_n, min_pct_change, min_delivery_qty,
     observe   = [c for c in top if c["price"] > trade_budget]
     lines = [
         f"📊 <b>Delivery Scanner — {today}</b>",
+        "<i>Completed market session (IST)</i>",
         f"Found <b>{len(candidates)}</b> setups (showing top {len(top)})",
         f"<i>Filters: %chg&gt;{min_pct_change}, deliv≥{min_delivery_qty} sh, "
         f"deliv×≥{min_delivery_times}, vol≥{min_vol_ratio_1d}×,</i>",
@@ -346,8 +414,9 @@ def _format_report(candidates, top_n, min_pct_change, min_delivery_qty,
 
 
 def _empty_message(min_pct_change, min_delivery_qty, min_delivery_times,
-                   min_vol_ratio_1d, note: str = "No stocks matched the filters today.") -> str:
-    today = datetime.now().strftime("%a, %d %b %Y")
+                   min_vol_ratio_1d, note: str = "No stocks matched the filters for this session.",
+                   session_date: date | None = None) -> str:
+    today = (session_date or datetime.now(IST).date()).strftime("%a, %d %b %Y")
     return (f"📊 <b>Delivery Scanner — {today}</b>\n\n"
             f"{_esc(note)}\n"
             f"<i>Filters: %chg&gt;{min_pct_change}, deliv≥{min_delivery_qty} "
@@ -396,6 +465,8 @@ def main() -> int:
     parser.add_argument("--top-n", type=int, default=25)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--as-of", type=date.fromisoformat,
+                        help="Explicit market-session date YYYY-MM-DD (default: today in IST)")
     args = parser.parse_args()
 
     setup_logging()
@@ -409,6 +480,7 @@ def main() -> int:
         min_pct_change      = args.min_pct_change,
         min_delivery_qty    = args.min_delivery_qty,
         min_delivery_times  = args.min_delivery_times,
+        delivery_lookback   = args.delivery_lookback,
         min_vol_ratio_1d    = args.min_vol_ratio_1d,
         require_above_200ema= args.require_above_200ema,
         min_market_cap_cr   = args.min_market_cap_cr,
@@ -424,6 +496,7 @@ def main() -> int:
         cache_dir           = args.cache_dir,
         top_n               = args.top_n,
         no_cache            = args.no_cache,
+        as_of               = args.as_of,
     )
 
     bot_token = chat_id = None

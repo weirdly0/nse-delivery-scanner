@@ -1,6 +1,6 @@
 # NSE Delivery + Volume Scanner
 
-A small Python scanner that finds NSE stocks with **high-conviction institutional buying** today and pushes the shortlist to Telegram.
+A small Python scanner that finds NSE stocks with **delivery and volume spikes** in a completed market session and pushes the shortlist to Telegram.
 
 A stock makes the shortlist when **all** of these are true:
 - Closed positive (`% change > 0`)
@@ -47,7 +47,34 @@ python delivery_scanner.py --min-delivery-times 5 --min-vol-ratio-1d 5
 python delivery_scanner.py --no-cache
 ```
 
-Best run **after 6 PM IST** — that's when NSE publishes the day's bhavcopy with delivery data. Before then, you get yesterday's numbers.
+Run at **10:30 PM IST** for the same day's completed market session. NSE publishes
+bhavcopy/delivery as end-of-day reports; publication and download availability are
+not guaranteed at a fixed minute. The scanner requires the requested date's file,
+validates its internal `DATE1`, and never substitutes an earlier session.
+
+The price, change, delivery and volume filters run on NSE data first, so only
+qualifying symbols need Yahoo history. This reduces bulk-fetch throttling.
+
+The verified NSE bhavcopy supplies the session's open/high/low/close, percentage
+change, traded quantity and delivery. The previous NSE session supplies the volume
+comparison. Yahoo supplies older chart history for EMAs and breakouts; it must
+reach the preceding available NSE session. A missing or intraday latest Yahoo bar
+cannot delay the report or replace NSE's final values. History that does not reach the preceding session is skipped, and incomplete
+coverage is shown. Internal gaps in older Yahoo history are not calendar-validated.
+
+Before market close, a missing report, or insufficient delivery history produces
+**data pending**, not a misleading zero-setup result. Weekends are skipped; a
+weekday with no file is reported as unavailable/possibly a market holiday.
+No exchange holiday calendar is assumed.
+
+For an explicit replay (including after midnight), choose the session:
+
+```bash
+python delivery_scanner.py --as-of 2026-09-15 --dry-run
+```
+
+The header always identifies the **market-session date**, not the server date.
+Default selection is today's date in `Asia/Kolkata`.
 
 ### All CLI options
 
@@ -63,23 +90,44 @@ Best run **after 6 PM IST** — that's when NSE publishes the day's bhavcopy wit
 | `--top-n` | `25` | How many top candidates to send |
 | `--dry-run` | _off_ | Print report instead of sending to Telegram |
 | `--no-cache` | _off_ | Re-download all bhavcopies |
+| `--as-of` | Today in IST | Explicit market-session date `YYYY-MM-DD` |
 
 ## Daily automation
 
-This repo includes a **GitHub Actions workflow** at `.github/workflows/scanner.yml` that runs the scanner **every weekday at 11 AM IST** (5:30 AM UTC) and pushes the report to your Telegram. To use it:
+**Azure is the only automatic scheduler:** `DailyScanner` in
+`nse-scanner-4e104b` runs weekdays at **22:30 IST / 17:00 UTC** using NCRONTAB
+`0 0 17 * * 1-5`. It sends the same-day completed-session report to Telegram.
+A market holiday or unavailable data produces a status message rather than old signals.
 
-1. Fork or clone this repo.
-2. Add two repo secrets at **Settings → Secrets and variables → Actions**:
-   - `TELEGRAM_BOT_TOKEN`
-   - `TELEGRAM_CHAT_ID`
-3. The workflow runs automatically. You can also trigger it manually from the **Actions** tab.
+`.github/workflows/scanner.yml` is **manual-only**, preventing a second morning
+alert. In the Actions tab, optionally enter an `as_of` date. Preview/dry-run is on
+by default; switch it off to send using the existing Telegram repository secrets.
+The manual workflow uses the full `nse_equity.csv` universe.
 
-> ⚠️ **Timing note:** NSE bhavcopy publishes around 6 PM IST. An 11 AM IST run uses **yesterday's** delivery data and **yesterday's** close. If you want the freshest signals, edit the cron in `.github/workflows/scanner.yml` to `30 12 * * 1-5` (= 6 PM IST).
+Deploy the code and timer together (GitHub changes alone do not deploy Azure):
 
-### Local cron alternative
+```bash
+func azure functionapp publish nse-scanner-4e104b --build remote --python \
+  --subscription 4ce9d3d4-989f-4f92-b751-d0d649e7de1a
+```
+
+After deployment, inspect the Azure function's timer binding to verify the new
+schedule. `DELIVERY_LOOKBACK` controls the prior-session delivery average (20 by
+default); the same setting is available as `--delivery-lookback` in the CLI.
+
+Run regression tests locally:
+
+```bash
+pip install -r requirements.txt pytest
+python -m pytest -q
+```
+
+### Local cron alternative (host timezone must be Asia/Kolkata)
+
+Use this only if Azure automation is disabled:
 
 ```cron
-0 18 * * 1-5  cd /path/to/scanner && /usr/bin/python3 delivery_scanner.py
+30 22 * * 1-5  cd /path/to/scanner && /usr/bin/python3 delivery_scanner.py
 ```
 
 ## Project layout
@@ -113,6 +161,6 @@ NSE publishes a daily **bhavcopy** — a CSV with OHLC, total traded quantity, a
 - `delivery_qty` = today's deliverable shares.
 - `delivery_times` = today's `delivery_qty` ÷ average over the prior 20 days.
 
-A `delivery_times` of 5× means today's institutional buying is 5× the recent baseline — a strong indicator that real money is accumulating, not just day traders.
+A `delivery_times` of 5× means deliverable quantity is five times the prior-session average. Delivery includes both buyers and sellers; it does not identify institutions or prove accumulation.
 
 Pair that with a breakout (close above 200 EMA) and a volume surge (3×+ over yesterday), and you have the same setup pattern Chandan's swing videos describe.

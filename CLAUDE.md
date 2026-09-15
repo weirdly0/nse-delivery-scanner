@@ -12,20 +12,42 @@ breakout + all-time-high/base breakout, ~30% target, stop at the breakout candle
 
 Entry point: `delivery_scanner.py::run_scan()` (pure-ish; CLI and Azure both call it).
 
-## How it runs (TWO schedulers — important)
+## How it runs
 
-1. **Azure Function** `nse-scanner-4e104b` (RG `rg-nse-scanner`, **outlook account
-   amitk.mishra1011@outlook.com**, "Visual Studio Enterprise Subscription", Central
-   India, Linux Consumption Y1, Python 3.11). Timer `0 30 5 * * 1-5` = 11:00 AM IST
-   Mon–Fri. Deploy: `az account set --subscription "Visual Studio Enterprise
-   Subscription"` then `func azure functionapp publish nse-scanner-4e104b --build
-   remote --python`. Config via App Settings (env vars), Telegram creds already set.
-2. **GitHub Actions** `.github/workflows/scanner.yml` ALSO runs `python
-   delivery_scanner.py` on cron 05:30 UTC Mon–Fri (uses repo secrets). So the report
-   can fire **twice/day** (Azure + Actions). If the user wants one, disable the other.
+1. **Azure Function** `nse-scanner-4e104b` (RG `rg-nse-scanner`, outlook account
+   `amitk.mishra1011@outlook.com`, Visual Studio Enterprise Subscription,
+   Central India, Linux Consumption Y1, Python 3.11). Timer
+   `0 0 17 * * 1-5` = **22:30 IST / 17:00 UTC**, weekdays.
+2. **GitHub Actions** `.github/workflows/scanner.yml` is **manual-only** to avoid
+   duplicate daily messages. It accepts `as_of` and defaults to dry-run.
 
-Git remote: `github.com:weirdly0/nse-delivery-scanner` (branch `main`). Deploy is from
-local code (`func publish`) AND from `main` (Actions); commit to `main` to update both.
+Git remote: `github.com:weirdly0/nse-delivery-scanner` (branch `main`).
+Azure deployment is separate from GitHub pushes:
+`func azure functionapp publish nse-scanner-4e104b --build remote --python
+--subscription 4ce9d3d4-989f-4f92-b751-d0d649e7de1a`.
+
+## Session freshness invariants
+
+- Default requested session is today's **IST** date. `--as-of YYYY-MM-DD` is an
+  explicit replay. Before 15:30 IST, report data pending; don't scan intraday bars.
+- Require the exact requested NSE bhavcopy; validate `DATE1` inside cached and
+  downloaded files. A missing current file is not permission to use yesterday.
+- Yahoo's `end` is **exclusive**, so request the day after the chosen session.
+- The verified NSE bhavcopy supplies the entire latest OHLCV bar and previous
+  close; the prior bhavcopy supplies previous volume. Yahoo history must reach
+  that prior session; truncate Yahoo's current/future bars before appending NSE.
+  Missing or partial latest Yahoo data must not delay a valid NSE EOD signal.
+- Apply daily price/change/delivery/volume filters from NSE before fetching Yahoo
+  history, so Yahoo requests are limited to the shortlist.
+- Report headers use the session date. Missing/stale coverage is visible.
+- Delivery average uses exactly the configured prior sessions (`DELIVERY_LOOKBACK`
+  / `--delivery-lookback`, default 20), excluding today. Incomplete/zero baselines
+  cannot generate signals.
+- No exchange holiday calendar: weekends are skipped; missing weekday files are
+  reported as pending/unavailable or a possible holiday. Publication timing is not
+  guaranteed, even at the evening schedule.
+- `python -m pytest -q` runs offline regressions (date mismatch, cache poisoning,
+  exclusive-end, partial bars, midnight IST, and schedule).
 
 ## Config (all env-tunable on Azure; CLI flags mirror them)
 

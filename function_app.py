@@ -70,10 +70,10 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 # NCRONTAB: {sec} {min} {hour} {day} {month} {day-of-week}
-# 0 30 5 * * 1-5 = 05:30 UTC = 11:00 AM IST, Mon-Fri
+# 0 0 17 * * 1-5 = 17:00 UTC = 10:30 PM IST, Mon-Fri
 @app.function_name(name="DailyScanner")
 @app.timer_trigger(
-    schedule="0 30 5 * * 1-5",
+    schedule="0 0 17 * * 1-5",
     arg_name="timer",
     run_on_startup=False,
     use_monitor=True,
@@ -107,6 +107,7 @@ def daily_scanner(timer: func.TimerRequest) -> None:
             min_pct_change       = _env_float("MIN_PCT_CHANGE",      0.0),
             min_delivery_qty     = _env_int("MIN_DELIVERY_QTY",      10000),
             min_delivery_times   = _env_float("MIN_DELIVERY_TIMES",  3.0),
+            delivery_lookback    = _env_int("DELIVERY_LOOKBACK",    20),
             min_vol_ratio_1d     = _env_float("MIN_VOL_RATIO_1D",    3.0),
             require_above_200ema = _env_bool("REQUIRE_ABOVE_200EMA", True),
             min_market_cap_cr    = _env_float("MIN_MARKET_CAP_CR",   100.0),

@@ -11,6 +11,8 @@ local.settings.json
 .DS_Store
 README.md
 .github/
+tests/
+.pytest_cache/
 results_*.json
 *.log
 backtest_*.py

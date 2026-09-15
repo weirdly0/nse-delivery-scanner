@@ -10,8 +10,10 @@ We only need OHLCV here; delivery data comes from the bhavcopy module.
 
 from __future__ import annotations
 import logging
+import math
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 import pandas as pd
@@ -36,7 +38,7 @@ def fetch_ohlc(
 
 def _fetch_yfinance(symbol: str, days: int) -> Optional[pd.DataFrame]:
     ticker = f"{symbol}.NS"
-    end = datetime.now()
+    end = datetime.now(ZoneInfo("Asia/Kolkata")) + timedelta(days=1)
     start = end - timedelta(days=days + 50)
     try:
         df = yf.download(
@@ -61,6 +63,7 @@ def fetch_ohlc_bulk(
     symbols: list[str],
     days: int = 250,
     batch_size: int = 100,
+    as_of: date | None = None,
 ) -> dict[str, pd.DataFrame]:
     """
     Bulk-download OHLC for many symbols in a few HTTP calls.
@@ -69,8 +72,10 @@ def fetch_ohlc_bulk(
 
     Returns {symbol: df} for symbols that came back with data.
     """
-    end = datetime.now()
-    start = end - timedelta(days=days + 50)
+    # Yahoo end is exclusive. Midnight of the following date includes as_of.
+    session = as_of or datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    end = session + timedelta(days=1)
+    start = end - timedelta(days=int(days * 1.6) + 30)
     start_s = start.strftime("%Y-%m-%d")
     end_s = end.strftime("%Y-%m-%d")
 
@@ -100,6 +105,11 @@ def fetch_ohlc_bulk(
         # yfinance returns a multi-level column DataFrame keyed by ticker
         # at the top level when group_by="ticker" and >1 ticker requested.
         if len(batch) == 1:
+            if isinstance(data.columns, pd.MultiIndex):
+                if tickers[0] in data.columns.get_level_values(0):
+                    data = data[tickers[0]]
+                else:
+                    data = data.xs(tickers[0], axis=1, level=1)
             df = data.dropna()
             if len(df) >= 60:
                 out[batch[0]] = df
@@ -161,6 +171,35 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # winning by screening out thin/illiquid junk breakouts.
     df["turnover_cr"] = (df["Close"] * df["Volume"]).rolling(20).mean() / 1e7
     df["pct_change"] = df["Close"].pct_change() * 100
+    return df
+
+
+def with_nse_session(df: pd.DataFrame, delivery: pd.Series, session: date,
+                     previous_session: date) -> Optional[pd.DataFrame]:
+    """Use verified NSE EOD OHLCV for today, Yahoo only through yesterday.
+
+    Require history through the immediately preceding session. The caller validates both
+    bhavcopy dates, so Yahoo can lag by the current session without delaying us.
+    """
+    df = df.copy()
+    dates = pd.DatetimeIndex(df.index)
+    if dates.tz is not None:
+        dates = dates.tz_convert(ZoneInfo("Asia/Kolkata")).tz_localize(None)
+    df.index = dates.normalize()
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    df = df.loc[df.index.date < session, ["Open", "High", "Low", "Close", "Volume"]]
+    if df.empty or df.index[-1].date() != previous_session:
+        return None
+    row = [float(delivery[k]) for k in ("open", "high", "low", "close", "traded_qty")]
+    previous_volume = float(delivery["previous_volume"])
+    previous_close = float(delivery["prev_close"])
+    if not all(math.isfinite(v) and v > 0 for v in row + [previous_volume, previous_close]):
+        return None
+    opening, high, low, close, _ = row
+    if not (low <= min(opening, close) <= max(opening, close) <= high):
+        return None
+    df.loc[df.index[-1], "Volume"] = previous_volume
+    df.loc[pd.Timestamp(session)] = row
     return df
 
 
